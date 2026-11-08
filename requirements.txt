@@ -1,0 +1,4 @@
+PyQt6
+m3u-ipytv
+python-vlc
+APScheduler
