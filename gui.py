@@ -1,6 +1,7 @@
 # gui.py
 import os
 import socket
+import ipaddress
 import traceback
 import threading
 import ctypes
@@ -16,7 +17,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QTimeEdit, QGroupBox,
     QAbstractItemView, QApplication, QSpinBox, QCheckBox,
     QGridLayout, QColorDialog, QDateEdit, QScrollArea,
-    QDialog, QTextBrowser
+    QDialog, QTextBrowser, QComboBox, QInputDialog
 )
 
 from playlist_manager import PlaylistManager
@@ -27,14 +28,13 @@ from server import create_app
 from ffmpeg_manager import FFmpegManager
 
 
-# ----------------------------------------------------------------------
-# Метаданные приложения
-# ----------------------------------------------------------------------
 APP_NAME = "IPTV Overlay Server"
-APP_VERSION = "1.0.0"
-APP_AUTHOR = "Andrey Geben"          # ← замените на своё имя
-APP_YEAR = "2026"
+APP_VERSION = "1.1.0"
+APP_AUTHOR = "Andrey Geben"
+APP_YEAR = "2025"
 APP_LICENSE = "MIT"
+
+SERVER_PORT = 8000
 
 DAYS = [("Пн", "mon"), ("Вт", "tue"), ("Ср", "wed"), ("Чт", "thu"),
         ("Пт", "fri"), ("Сб", "sat"), ("Вс", "sun")]
@@ -65,7 +65,6 @@ def _win_choose_color(parent, initial: QColor):
     custom = (wintypes.COLORREF * 16)()
     for i in range(16):
         custom[i] = 0x00FFFFFF
-
     rgb = (initial.blue() << 16) | (initial.green() << 8) | initial.red()
 
     cc = _CHOOSECOLORW()
@@ -106,7 +105,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME}  v{APP_VERSION}")
         self.resize(1500, 950)
-        # Иконка окна (наследуется от QApplication, но зададим явно)
+
         icon_path = Path(__file__).parent / "assets" / "icon.ico"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -126,27 +125,173 @@ class MainWindow(QMainWindow):
         self._box_color = QColor(0, 0, 0)
         self._box_alpha = 153
 
-        self.local_ip = self._get_local_ip()
-        self.base_url = f"http://{self.local_ip}:8000"
+        # IP-настройки
+        self.local_ip = self._pick_default_ip()
+        self.base_url = f"http://{self.local_ip}:{SERVER_PORT}"
 
         self._init_ui()
         self._create_menubar()
         self._connect_signals()
         self._update_ffmpeg_status()
+        self._refresh_ip_combo()
         self._update_playlist_url()
         self._refresh_color_buttons()
 
     # ------------------------------------------------------------------
-    def _get_local_ip(self) -> str:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
-            return "127.0.0.1"
+    # Сетевые интерфейсы
+    # ------------------------------------------------------------------
+    def _get_available_ips(self) -> list[tuple[str, str]]:
+        """
+        Возвращает [(имя_интерфейса, ip), ...] только для «живых» IPv4-адресов.
+        Первый пункт — localhost (127.0.0.1) — всегда доступен.
+        Отбрасываются: APIPA (169.254.x.x), multicast, broadcast,
+        unspecified (0.0.0.0), reserved, а также выключенные интерфейсы.
+        """
+        result = [("Локальный (только этот ПК)", "127.0.0.1")]
 
+        def is_usable(ip_str: str) -> bool:
+            """True, если по этому адресу можно достучаться по сети."""
+            try:
+                ip = ipaddress.IPv4Address(ip_str)
+            except ValueError:
+                return False
+            # Служебные и мёртвые диапазоны
+            if ip.is_loopback:        # 127.x.x.x — уже добавлен отдельно
+                return False
+            if ip.is_link_local:      # 169.254.x.x — APIPA, DHCP не сработал
+                return False
+            if ip.is_multicast:       # 224–239.x.x.x — групповые рассылки
+                return False
+            if ip.is_unspecified:     # 0.0.0.0
+                return False
+            if ip.is_reserved:        # 240.x.x.x и прочие зарезервированные
+                return False
+            return True
+
+        try:
+            import psutil
+            if_stats = psutil.net_if_stats()  # состояние up/down
+
+            for iface, addrs in psutil.net_if_addrs().items():
+                # Пропускаем выключенные интерфейсы (кабель выдернут, Wi-Fi off)
+                if iface in if_stats and not if_stats[iface].isup:
+                    continue
+                for addr in addrs:
+                    if addr.family == socket.AF_INET and is_usable(addr.address):
+                        result.append((iface, addr.address))
+
+            # Сортировка: Ethernet → Wi-Fi → остальные
+            def sort_key(item: tuple[str, str]) -> tuple[int, str]:
+                name = item[0].lower()
+                if "ethernet" in name:
+                    return (0, name)
+                if "wi-fi" in name or "wifi" in name or "wlan" in name:
+                    return (1, name)
+                return (2, name)
+
+            # Первый элемент (localhost) оставляем на месте, сортируем только остальное
+            if len(result) > 1:
+                tail = sorted(result[1:], key=sort_key)
+                result = [result[0]] + tail
+
+            return result
+
+        except ImportError:
+            # Fallback без psutil — фильтруем по диапазонам IP
+            try:
+                hostname = socket.gethostname()
+                _, _, ips = socket.gethostbyname_ex(hostname)
+                ips = [ip for ip in ips if is_usable(ip)]
+                result.extend(
+                    (f"Интерфейс {i + 1}", ip) for i, ip in enumerate(ips)
+                )
+                return result
+            except Exception as e:
+                print(f"[IP] Не удалось получить адреса: {e}")
+                return result
+
+    def _pick_default_ip(self) -> str:
+        """
+        Возвращает первый реальный (не localhost) IP.
+        Если реальных нет — 127.0.0.1.
+        """
+        ips = self._get_available_ips()
+        for _, ip in ips:
+            if not ip.startswith("127."):
+                return ip
+        return "127.0.0.1"
+
+    def _is_local_ip(self, ip: str) -> bool:
+        if ip == "127.0.0.1":
+            return True
+        return any(local_ip == ip for _, local_ip in self._get_available_ips())
+
+    def _refresh_ip_combo(self):
+        """Пересобирает список IP-адресов, сохраняя текущий выбор."""
+        current = self.local_ip
+        self.combo_ip.blockSignals(True)
+        self.combo_ip.clear()
+
+        ips = self._get_available_ips()
+        for iface, ip in ips:
+            self.combo_ip.addItem(f"{iface} — {ip}", userData=ip)
+
+        self.combo_ip.addItem("Ввести IP вручную…", userData="__custom__")
+
+        # Выбираем текущий IP, если он есть в списке
+        idx = self.combo_ip.findData(current)
+        if idx >= 0:
+            self.combo_ip.setCurrentIndex(idx)
+        else:
+            # Если текущий IP не обнаружен (например, ручной ввод) — добавляем первым
+            self.combo_ip.insertItem(0, f"Текущий — {current}", userData=current)
+            self.combo_ip.setCurrentIndex(0)
+
+        self.combo_ip.blockSignals(False)
+
+    def _on_ip_combo_changed(self):
+        data = self.combo_ip.currentData()
+        if data == "__custom__":
+            text, ok = QInputDialog.getText(
+                self, "Свой IP-адрес",
+                "Введите IP или домен для ссылок исходящего плейлиста:",
+                text=self.local_ip,
+            )
+            if ok and text.strip():
+                self._set_ip(text.strip())
+            else:
+                # Откат: пересобираем combo по текущему значению
+                self._refresh_ip_combo()
+        elif data:
+            self._set_ip(data)
+
+    def _set_ip(self, ip: str):
+        old = self.local_ip
+        self.local_ip = ip
+        self.base_url = f"http://{self.local_ip}:{SERVER_PORT}"
+        self._update_playlist_url()
+
+        is_loopback = ip.startswith("127.")
+        if not self._is_local_ip(ip) and not is_loopback:
+            QMessageBox.warning(
+                self, "Внимание",
+                f"IP {ip} не обнаружен ни на одном сетевом интерфейсе.\n\n"
+                "Это нормально, если вы используете внешний IP через NAT или VPN — "
+                "тогда убедитесь, что порт 8000 проброшен на эту машину.\n\n"
+                "В остальных случаях плейлист по этому адресу будет недоступен из локальной сети."
+            )
+
+        if old != ip:
+            if is_loopback:
+                self.label_status.setText(
+                    f"IP: 127.0.0.1 — плейлист доступен только на этом ПК"
+                )
+            else:
+                self.label_status.setText(
+                    f"IP исходящего плейлиста изменён: {old} → {ip}"
+                )
+
+    # ------------------------------------------------------------------
     def _prepare_ffmpeg(self) -> str:
         try:
             return self.ffmpeg_manager.ensure_ffmpeg()
@@ -172,21 +317,16 @@ class MainWindow(QMainWindow):
     def _create_menubar(self):
         menubar = self.menuBar()
 
-        # --- Меню «Справка» ---
         help_menu = menubar.addMenu("Справка")
-
         act_help = QAction("Руководство пользователя", self)
         act_help.setShortcut("F1")
         act_help.triggered.connect(self.show_help)
         help_menu.addAction(act_help)
-
         help_menu.addSeparator()
-
         act_about = QAction("О программе", self)
         act_about.triggered.connect(self.show_about)
         help_menu.addAction(act_about)
 
-        # --- Меню «Файл» (для быстрого выхода) ---
         file_menu = menubar.addMenu("Файл")
         act_exit = QAction("Выход", self)
         act_exit.setShortcut("Ctrl+Q")
@@ -194,63 +334,48 @@ class MainWindow(QMainWindow):
         file_menu.addAction(act_exit)
 
     def show_help(self):
-        """Открывает README.md во встроенном просмотрщике."""
         readme_path = Path(__file__).parent / "README.md"
-        if readme_path.exists():
-            text = readme_path.read_text(encoding="utf-8")
-        else:
-            text = (
-                "# Руководство пользователя\n\n"
-                "Файл README.md не найден рядом с программой.\n\n"
-                "Положите README.md в корень проекта — здесь появится его содержимое."
-            )
+        text = readme_path.read_text(encoding="utf-8") if readme_path.exists() else \
+            "# Руководство пользователя\n\nФайл README.md не найден."
 
         dlg = QDialog(self)
         dlg.setWindowTitle(f"{APP_NAME} — Руководство пользователя")
         dlg.resize(900, 700)
-
         layout = QVBoxLayout(dlg)
         browser = QTextBrowser()
         browser.setMarkdown(text)
         browser.setOpenExternalLinks(True)
         layout.addWidget(browser)
-
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         btn_close = QPushButton("Закрыть")
         btn_close.clicked.connect(dlg.accept)
         btn_row.addWidget(btn_close)
         layout.addLayout(btn_row)
-
         dlg.exec()
 
     def show_about(self):
-        """Стандартный диалог «О программе» с авторскими правами."""
         html = f"""
         <h2>{APP_NAME}</h2>
         <p><b>Версия:</b> {APP_VERSION}</p>
         <p>Программа для организации IPTV-трансляции с наложением
         бегущих строк на выбранные каналы по расписанию.</p>
-
         <hr>
         <p><b>Автор:</b> {APP_AUTHOR}</p>
         <p><b>© {APP_YEAR} {APP_AUTHOR}. Все права защищены.</b></p>
         <p><b>Лицензия:</b> {APP_LICENSE}</p>
         <hr>
-
         <p><b>Технологии:</b></p>
         <ul>
-            <li><b>Python 3.10+</b> — язык программирования</li>
-            <li><b>PyQt6</b> — графический интерфейс</li>
-            <li><b>FastAPI</b> + <b>Uvicorn</b> — HTTP-сервер</li>
-            <li><b>FFmpeg</b> — обработка видео и наложение текста</li>
-            <li><b>APScheduler</b> — планировщик расписания</li>
+            <li>Python 3.10+</li>
+            <li>PyQt6</li>
+            <li>FastAPI + Uvicorn</li>
+            <li>FFmpeg</li>
+            <li>APScheduler</li>
+            <li>psutil</li>
         </ul>
-
         <p style="color: #666; font-size: 10px;">
         Программа предоставляется «как есть», без каких-либо гарантий.
-        Автор не несёт ответственности за содержимое транслируемых каналов
-        и соблюдение прав правообладателей.
         </p>
         """
         QMessageBox.about(self, "О программе", html)
@@ -282,23 +407,46 @@ class MainWindow(QMainWindow):
         srv_layout.addWidget(self.btn_stop_server)
         left_layout.addLayout(srv_layout)
 
+        # Исходящий плейлист
         outgoing = QGroupBox("Исходящий плейлист (для клиента)")
         out_l = QVBoxLayout(outgoing)
+
+        # --- Выбор сетевого интерфейса ---
+        ip_row = QHBoxLayout()
+        ip_row.addWidget(QLabel("Интерфейс:"))
+        self.combo_ip = QComboBox()
+        self.combo_ip.setMinimumWidth(200)
+        ip_row.addWidget(self.combo_ip, 1)
+        self.btn_refresh_ips = QPushButton("⟳")
+        self.btn_refresh_ips.setMaximumWidth(32)
+        self.btn_refresh_ips.setToolTip("Обновить список IP-адресов")
+        ip_row.addWidget(self.btn_refresh_ips)
+        out_l.addLayout(ip_row)
+
+        # URL
         self.edit_playlist_url = QLineEdit()
         self.edit_playlist_url.setReadOnly(True)
         self.edit_playlist_url.setStyleSheet("background-color: #f0f0f0;")
         out_l.addWidget(self.edit_playlist_url)
+
         row = QHBoxLayout()
         self.btn_copy_url = QPushButton("Копировать")
         self.btn_save_playlist = QPushButton("Сохранить…")
         row.addWidget(self.btn_copy_url)
         row.addWidget(self.btn_save_playlist)
         out_l.addLayout(row)
+
         self.btn_show_playlist = QPushButton("Показать содержимое")
         out_l.addWidget(self.btn_show_playlist)
-        hint = QLabel(f"Открыть в VLC/IPTV: {self.local_ip}")
+
+        hint = QLabel(
+            "Выберите интерфейс, по которому клиенты будут подключаться. "
+            "Смена IP не требует перезапуска сервера."
+        )
         hint.setStyleSheet("color: #555; font-size: 11px;")
+        hint.setWordWrap(True)
         out_l.addWidget(hint)
+
         left_layout.addWidget(outgoing)
 
         scheduled = QGroupBox("Запланированные оверлеи")
@@ -487,6 +635,9 @@ class MainWindow(QMainWindow):
         self.btn_show_playlist.clicked.connect(self.show_playlist_content)
         self.btn_remove_overlay.clicked.connect(self.remove_scheduled_overlay)
 
+        self.combo_ip.currentIndexChanged.connect(self._on_ip_combo_changed)
+        self.btn_refresh_ips.clicked.connect(self._on_refresh_ips)
+
         self.list_incoming.itemChanged.connect(self._on_incoming_changed)
         self.btn_incoming_all.clicked.connect(self._incoming_check_all)
         self.btn_incoming_clear.clicked.connect(self._incoming_clear_all)
@@ -503,6 +654,14 @@ class MainWindow(QMainWindow):
         self.spin_box_alpha.valueChanged.connect(self._on_box_alpha_changed)
         self.btn_add_overlay.clicked.connect(self.add_overlay)
 
+    def _on_refresh_ips(self):
+        self._refresh_ip_combo()
+        self.label_status.setText(
+            f"Список IP обновлён (найдено {self.combo_ip.count() - 1})"
+        )
+
+    # ------------------------------------------------------------------
+    # Синхронизация панелей 1 ↔ 2 ↔ PlaylistManager.broadcast_channel_ids
     # ------------------------------------------------------------------
     def refresh_incoming_list(self):
         self.list_incoming.blockSignals(True)
@@ -803,11 +962,17 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Информация", "Сервер уже запущен")
             return
 
-        app = create_app(self.playlist_manager, self.stream_engine, self.base_url)
+        # ВАЖНО: передаём функцию, а не строку — URL будет актуальным
+        # даже если пользователь сменит IP после запуска сервера.
+        app = create_app(
+            self.playlist_manager,
+            self.stream_engine,
+            lambda: self.base_url,
+        )
 
         def run():
             try:
-                uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+                uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT, log_level="info")
             except Exception as e:
                 print(f"[Server] Ошибка: {e}")
 
