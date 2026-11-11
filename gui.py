@@ -1,12 +1,14 @@
 # gui.py
 import os
 import socket
+import sys
 import ipaddress
 import traceback
 import threading
 import ctypes
 import ctypes.wintypes as wintypes
 from pathlib import Path
+
 
 import uvicorn
 from PyQt6.QtCore import Qt, QTime, QDate
@@ -39,6 +41,24 @@ SERVER_PORT = 8000
 DAYS = [("Пн", "mon"), ("Вт", "tue"), ("Ср", "wed"), ("Чт", "thu"),
         ("Пт", "fri"), ("Сб", "sat"), ("Вс", "sun")]
 
+def get_data_path(relative_path: str) -> Path:
+    """
+    Ищет файл в порядке:
+      1. Рядом с .exe (dist-сборка) — чтобы README можно было править
+      2. В _MEIPASS (если упакован через --add-data)
+      3. Рядом с gui.py (запуск из PyCharm)
+    """
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).parent
+        candidate = exe_dir / relative_path
+        if candidate.exists():
+            return candidate
+        if hasattr(sys, "_MEIPASS"):
+            candidate = Path(sys._MEIPASS) / relative_path
+            if candidate.exists():
+                return candidate
+        return exe_dir / relative_path
+    return Path(__file__).parent / relative_path
 
 # ======================================================================
 # Нативный диалог выбора цвета
@@ -334,7 +354,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(act_exit)
 
     def show_help(self):
-        readme_path = Path(__file__).parent / "README.md"
+        readme_path = get_data_path("README.md")
         text = readme_path.read_text(encoding="utf-8") if readme_path.exists() else \
             "# Руководство пользователя\n\nФайл README.md не найден."
 
@@ -972,9 +992,25 @@ class MainWindow(QMainWindow):
 
         def run():
             try:
-                uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT, log_level="info")
+                uvicorn.run(
+                    app,
+                    host="0.0.0.0",
+                    port=SERVER_PORT,
+                    log_level="info",
+                    log_config=None,          # ← КРИТИЧНО для --windowed
+                )
             except Exception as e:
-                print(f"[Server] Ошибка: {e}")
+                import traceback
+                tb = traceback.format_exc()
+                print(f"[Server] ОШИБКА: {e}")
+                print(tb)
+                try:
+                    base = Path(sys.executable).parent \
+                        if getattr(sys, "frozen", False) else Path(__file__).parent
+                    with open(base / "error.log", "a", encoding="utf-8") as f:
+                        f.write(f"[Server] ОШИБКА: {e}\n{tb}\n")
+                except Exception:
+                    pass
 
         self.server_thread = threading.Thread(target=run, daemon=True)
         self.server_thread.start()
