@@ -1,4 +1,5 @@
 PyQt6
-m3u-ipytv
-python-vlc
-APScheduler
+fastapi
+uvicorn
+apscheduler
+psutil

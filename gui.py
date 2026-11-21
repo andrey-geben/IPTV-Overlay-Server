@@ -5,13 +5,14 @@ import sys
 import ipaddress
 import traceback
 import threading
+import uuid
 import ctypes
 import ctypes.wintypes as wintypes
 from pathlib import Path
 
 
 import uvicorn
-from PyQt6.QtCore import Qt, QTime, QDate
+from PyQt6.QtCore import Qt, QTime, QDate, QTimer
 from PyQt6.QtGui import QColor, QAction, QIcon
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -31,7 +32,7 @@ from ffmpeg_manager import FFmpegManager
 
 
 APP_NAME = "IPTV Overlay Server"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 APP_AUTHOR = "Andrey Geben"
 APP_YEAR = "2025"
 APP_LICENSE = "MIT"
@@ -139,6 +140,7 @@ class MainWindow(QMainWindow):
 
         self.overlays: list[Overlay] = []
         self.server_thread = None
+        self.uvicorn_server = None
 
         self._font_color = QColor(255, 255, 255)
         self._font_alpha = 255
@@ -690,7 +692,11 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(f"{ch.id}. {ch.name}")
             item.setData(Qt.ItemDataRole.UserRole, ch.id)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if ch.id in self.playlist_manager.broadcast_channel_ids
+                else Qt.CheckState.Unchecked
+            )
             self.list_incoming.addItem(item)
         self.list_incoming.blockSignals(False)
         self._sync_broadcast_list()
@@ -766,6 +772,11 @@ class MainWindow(QMainWindow):
         if self.stream_engine.is_active(cid):
             self.stream_engine.stop_overlay(cid)
         self.playlist_manager.remove_channel(row)
+        # Убираем удалённый канал из существующих оверлеев, чтобы планировщик
+        # не пытался запустить для него FFmpeg.
+        for overlay in self.overlays:
+            if cid in overlay.channel_ids:
+                overlay.channel_ids.remove(cid)
         self.refresh_incoming_list()
 
     # ------------------------------------------------------------------
@@ -873,6 +884,12 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
+            # Старые оверлеи привязаны к ID прежнего плейлиста — сбрасываем их.
+            self.stream_engine.shutdown()
+            for overlay in list(self.overlays):
+                self.scheduler.remove_schedule(overlay.id)
+            self.overlays.clear()
+            self.list_overlays.clear()
             count = self.playlist_manager.load_from_file(path)
             self.refresh_incoming_list()
             if count == 0:
@@ -903,7 +920,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Внимание", "Введите текст")
             return
 
-        overlay_id = f"ov_{len(self.overlays) + 1}"
+        overlay_id = f"ov_{uuid.uuid4().hex[:8]}"
         start_date = self.date_start.date().toString("yyyy-MM-dd")
         end_date = ""
         if self.chk_end_date.isChecked():
@@ -966,10 +983,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Внимание", "Выберите оверлей")
             return
         overlay = self.overlays[row]
+        remaining = [o for i, o in enumerate(self.overlays) if i != row]
         for cid in overlay.channel_ids:
-            if self.stream_engine.is_active(cid):
+            if not any(cid in other.channel_ids for other in remaining):
                 self.stream_engine.stop_overlay(cid)
         self.scheduler.remove_schedule(overlay.id)
+        overlay.active = False
         del self.overlays[row]
         self.list_overlays.takeItem(row)
 
@@ -982,25 +1001,32 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Информация", "Сервер уже запущен")
             return
 
-        # ВАЖНО: передаём функцию, а не строку — URL будет актуальным
-        # даже если пользователь сменит IP после запуска сервера.
+        # Планировщик мог быть остановлен вместе с сервером — поднимаем его
+        # и восстанавливаем расписания существующих оверлеев.
+        if not self.scheduler.is_running:
+            self.scheduler.start()
+            for overlay in list(self.overlays):
+                self.scheduler.add_schedule(overlay)
+
         app = create_app(
             self.playlist_manager,
             self.stream_engine,
             lambda: self.base_url,
         )
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=SERVER_PORT,
+            log_level="info",
+            log_config=None,
+        )
+        server = uvicorn.Server(config)
+        self.uvicorn_server = server
 
         def run():
             try:
-                uvicorn.run(
-                    app,
-                    host="0.0.0.0",
-                    port=SERVER_PORT,
-                    log_level="info",
-                    log_config=None,          # ← КРИТИЧНО для --windowed
-                )
+                server.run()
             except Exception as e:
-                import traceback
                 tb = traceback.format_exc()
                 print(f"[Server] ОШИБКА: {e}")
                 print(tb)
@@ -1017,20 +1043,46 @@ class MainWindow(QMainWindow):
         self.btn_start_server.setEnabled(False)
         self.btn_stop_server.setEnabled(True)
         self.label_status.setText(f"Сервер запущен: {self.base_url}/playlist.m3u")
+        QTimer.singleShot(1500, self._verify_server_started)
+
+    def _verify_server_started(self):
+        if self.server_thread and not self.server_thread.is_alive():
+            self.uvicorn_server = None
+            self.btn_start_server.setEnabled(True)
+            self.btn_stop_server.setEnabled(False)
+            self.stream_engine.shutdown()
+            self.scheduler.shutdown()
+            self.label_status.setText("Ошибка запуска сервера (порт занят?)")
+            QMessageBox.critical(self, "Ошибка сервера",
+                                 f"Не удалось запустить сервер на порту {SERVER_PORT}.\n"
+                                 "Проверьте, не занят ли порт другой программой.")
+            return
+        if self.uvicorn_server is not None and not self.uvicorn_server.started:
+            self.label_status.setText("Сервер запускается…")
 
     def stop_server(self):
+        self._stop_server(silent=False)
+
+    def _stop_server(self, silent: bool = False):
+        server = self.uvicorn_server
+        if server is not None:
+            server.should_exit = True
+        thread = self.server_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
+        self.server_thread = None
+        self.uvicorn_server = None
+
         self.stream_engine.shutdown()
         self.scheduler.shutdown()
-        QMessageBox.information(self, "Информация",
-                                "FFmpeg-процессы и планировщик остановлены.")
+
         self.btn_start_server.setEnabled(True)
         self.btn_stop_server.setEnabled(False)
         self.label_status.setText("Сервер остановлен")
+        if not silent:
+            QMessageBox.information(self, "Информация",
+                                    "Сервер, FFmpeg-процессы и планировщик остановлены.")
 
     def closeEvent(self, event):
-        self.stream_engine.shutdown()
-        try:
-            self.scheduler.shutdown()
-        except Exception:
-            pass
+        self._stop_server(silent=True)
         event.accept()

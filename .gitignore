@@ -33,3 +33,7 @@ Thumbs.db
 
 # Логи
 *.log
+
+# Local FFmpeg binary and release archives
+/ffmpeg.exe
+/*.zip

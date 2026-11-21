@@ -1,139 +1,129 @@
 # ffmpeg_manager.py
+"""Поиск/загрузка FFmpeg. Один экземпляр класса, пути рядом с exe/скриптом."""
+from __future__ import annotations
+
 import os
-import sys
+import platform
 import shutil
-import subprocess
+import sys
+import tarfile
 import urllib.request
 import zipfile
-import tarfile
-import platform
 from pathlib import Path
 
 
 class FFmpegManager:
-    """
-    Управляет наличием FFmpeg: проверяет, скачивает и возвращает путь к бинарнику.
-    """
-
     def __init__(self, install_dir: str = "ffmpeg_bin"):
-        self.install_dir = Path(install_dir)
-        self.ffmpeg_path = None
+        base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+        self.install_dir = base / install_dir
+        self.ffmpeg_path: str | None = None
+
+    def _get_local_ffmpeg_path(self) -> Path | None:
+        exe_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+        candidates = [self.install_dir / exe_name]
+        if getattr(sys, "frozen", False):
+            candidates.insert(0, Path(sys.executable).parent / exe_name)
+        else:
+            candidates.insert(0, Path(__file__).parent / exe_name)
+        if hasattr(sys, "_MEIPASS"):
+            candidates.append(Path(sys._MEIPASS) / exe_name)
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return None
 
     def ensure_ffmpeg(self) -> str:
-        """
-        Главный метод. Проверяет наличие FFmpeg в системе или в локальной папке.
-        Если не найден — скачивает и распаковывает.
-        Возвращает путь к исполняемому файлу ffmpeg.
-        """
-        # 1. Проверяем, есть ли ffmpeg в системе (PATH)
         system_ffmpeg = shutil.which("ffmpeg")
         if system_ffmpeg:
-            print(f"[FFmpegManager] Найден системный FFmpeg: {system_ffmpeg}")
+            print(f"[FFmpegManager] Системный FFmpeg: {system_ffmpeg}")
             self.ffmpeg_path = system_ffmpeg
             return self.ffmpeg_path
 
-        # 2. Проверяем, не скачан ли уже FFmpeg в локальную папку
-        local_ffmpeg = self._get_local_ffmpeg_path()
-        if local_ffmpeg and local_ffmpeg.exists():
-            print(f"[FFmpegManager] Найден локальный FFmpeg: {local_ffmpeg}")
-            self.ffmpeg_path = str(local_ffmpeg)
+        local = self._get_local_ffmpeg_path()
+        if local:
+            print(f"[FFmpegManager] Локальный FFmpeg: {local}")
+            self.ffmpeg_path = str(local)
             return self.ffmpeg_path
 
-        # 3. Если нигде нет — скачиваем
-        print("[FFmpegManager] FFmpeg не найден. Начинаю загрузку...")
+        print("[FFmpegManager] FFmpeg не найден, скачиваю...")
         self._download_and_extract()
-
-        # После распаковки снова проверяем локальный путь
-        local_ffmpeg = self._get_local_ffmpeg_path()
-        if local_ffmpeg and local_ffmpeg.exists():
-            self.ffmpeg_path = str(local_ffmpeg)
-            print(f"[FFmpegManager] FFmpeg успешно установлен: {self.ffmpeg_path}")
-            return self.ffmpeg_path
-        else:
+        local = self._get_local_ffmpeg_path()
+        if not local:
             raise RuntimeError("Не удалось найти или скачать FFmpeg.")
+        self.ffmpeg_path = str(local)
+        print(f"[FFmpegManager] FFmpeg установлен: {self.ffmpeg_path}")
+        return self.ffmpeg_path
 
-    def _get_local_ffmpeg_path(self) -> Path | None:
-        """Возвращает ожидаемый путь к локальному бинарнику FFmpeg."""
-        exe_name = "ffmpeg.exe" if os.name == 'nt' else "ffmpeg"
-        # BtbN распаковывает архив в подпапку, поэтому ищем файл рекурсивно
-        # Но для простоты предполагаем, что мы распакуем его в корень install_dir
-        return self.install_dir / exe_name
-
-    def _download_and_extract(self):
-        """Скачивает и распаковывает архив с FFmpeg для текущей ОС."""
+    def _download_and_extract(self) -> None:
         system = platform.system().lower()
         arch = platform.machine().lower()
-
-        # Определяем URL для скачивания в зависимости от ОС и архитектуры
-        # Используем BtbN/FFmpeg-Builds (статические сборки)
         if system == "windows":
-            if "64" in arch or "amd64" in arch:
-                # Windows x86_64
-                url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
-            else:
+            if "64" not in arch and "amd64" not in arch:
                 raise RuntimeError(f"Неподдерживаемая архитектура Windows: {arch}")
+            url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
         elif system == "linux":
-            if "64" in arch or "x86_64" in arch:
-                url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
-            elif "arm" in arch or "aarch64" in arch:
+            if "arm" in arch or "aarch64" in arch:
                 url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz"
+            elif "64" in arch or "x86_64" in arch:
+                url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
             else:
                 raise RuntimeError(f"Неподдерживаемая архитектура Linux: {arch}")
-        elif system == "darwin":  # macOS
-            # BtbN в основном предоставляет сборки для Windows и Linux.
-            # Для macOS можно использовать сборки от Martin Riedl или eugeneware/ffmpeg-static.
-            # В качестве запасного варианта используем универсальную сборку (если доступна).
-            # Для простоты в этом примере оставим macOS без автоматической загрузки,
-            # но вы можете добавить URL для macOS (например, с https://ffmpeg.martin-riedl.de/).
-            print("[FFmpegManager] Для macOS автоматическая загрузка не настроена. "
-                  "Пожалуйста, установите FFmpeg через 'brew install ffmpeg'.")
-            raise RuntimeError("Автоматическая загрузка для macOS не поддерживается в этой конфигурации.")
         else:
-            raise RuntimeError(f"Неподдерживаемая операционная система: {system}")
+            raise RuntimeError(
+                f"Автоматическая загрузка FFmpeg для {system} не поддерживается. "
+                "Установите FFmpeg в PATH."
+            )
 
-        # Создаем папку для установки
         self.install_dir.mkdir(parents=True, exist_ok=True)
-
-        # Скачиваем архив
-        archive_path = self.install_dir / os.path.basename(url)
+        archive = self.install_dir / Path(url).name
         print(f"[FFmpegManager] Скачивание: {url}")
-        urllib.request.urlretrieve(url, archive_path)
+        with urllib.request.urlopen(url, timeout=120) as response, open(archive, "wb") as out:
+            while True:
+                chunk = response.read(1024 * 256)
+                if not chunk:
+                    break
+                out.write(chunk)
 
-        # Распаковываем
-        print("[FFmpegManager] Распаковка...")
-        if url.endswith(".zip"):
-            with zipfile.ZipFile(archive_path, 'r') as zip_ref:
-                zip_ref.extractall(self.install_dir)
-        elif url.endswith(".tar.xz"):
-            with tarfile.open(archive_path, 'r:xz') as tar_ref:
-                tar_ref.extractall(self.install_dir)
-        else:
-            raise RuntimeError(f"Неизвестный формат архива: {archive_path}")
-
-        # Удаляем скачанный архив (опционально)
-        archive_path.unlink()
-
-        # BtbN распаковывает файлы в подпапку (например, ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe)
-        # Нам нужно переместить бинарник в корень install_dir или запомнить путь к нему.
-        # Найдем исполняемый файл рекурсивно и переместим его.
+        try:
+            if archive.suffix.lower() == ".zip":
+                self._safe_extract_zip(archive)
+            else:
+                self._safe_extract_tar(archive)
+        finally:
+            archive.unlink(missing_ok=True)
         self._flatten_extracted_files()
 
-    def _flatten_extracted_files(self):
-        """
-        Перемещает ffmpeg и ffprobe из вложенных папок в корень install_dir.
-        """
-        target_names = ["ffmpeg.exe", "ffmpeg", "ffprobe.exe", "ffprobe"]
-        # Ищем все файлы в install_dir рекурсивно
-        for file_path in self.install_dir.rglob("*"):
-            if file_path.is_file() and file_path.name in target_names:
-                # Перемещаем в корень install_dir
-                target_path = self.install_dir / file_path.name
-                if not target_path.exists():
-                    shutil.move(str(file_path), str(target_path))
-                    print(f"[FFmpegManager] Перемещен: {file_path.name}")
+    def _safe_extract_zip(self, archive: Path) -> None:
+        dest = self.install_dir.resolve()
+        with zipfile.ZipFile(archive) as zf:
+            for member in zf.infolist():
+                target = (dest / member.filename).resolve()
+                if target != dest and dest not in target.parents:
+                    raise RuntimeError(f"Небезопасный путь в архиве: {member.filename}")
+            zf.extractall(dest)
+
+    def _safe_extract_tar(self, archive: Path) -> None:
+        dest = self.install_dir.resolve()
+        with tarfile.open(archive, "r:*") as tf:
+            try:
+                tf.extractall(dest, filter="data")
+            except TypeError:  # Python < 3.12
+                for member in tf.getmembers():
+                    target = (dest / member.name).resolve()
+                    if target != dest and dest not in target.parents:
+                        raise RuntimeError(f"Небезопасный путь в архиве: {member.name}")
+                tf.extractall(dest)
+
+    def _flatten_extracted_files(self) -> None:
+        names = {"ffmpeg.exe", "ffmpeg", "ffprobe.exe", "ffprobe"}
+        for path in self.install_dir.rglob("*"):
+            if path.is_file() and path.name in names:
+                target = self.install_dir / path.name
+                if path != target and not target.exists():
+                    shutil.move(str(path), str(target))
+                    print(f"[FFmpegManager] Перемещён: {path.name}")
 
     def get_ffmpeg_path(self) -> str:
-        """Возвращает путь к ffmpeg. Должен вызываться после ensure_ffmpeg()."""
         if not self.ffmpeg_path:
             raise RuntimeError("Сначала вызовите ensure_ffmpeg()")
         return self.ffmpeg_path

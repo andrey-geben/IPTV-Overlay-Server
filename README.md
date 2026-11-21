@@ -109,6 +109,7 @@ PyQt6
 fastapi
 uvicorn
 apscheduler
+psutil
 ```
 
 ### 4. Запустите

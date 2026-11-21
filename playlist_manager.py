@@ -10,6 +10,8 @@ class PlaylistManager:
         # Набор id каналов, отмеченных для трансляции (панель 1 в GUI).
         # Пустой набор = ничего не транслируется, в исходящем плейлисте пусто.
         self.broadcast_channel_ids: Set[int] = set()
+        self._next_id = 1
+        self._by_id: dict[int, Channel] = {}
 
     # ------------------------------------------------------------------
     # Загрузка M3U
@@ -17,6 +19,8 @@ class PlaylistManager:
     def load_from_file(self, file_path: str) -> int:
         self.channels.clear()
         self.broadcast_channel_ids.clear()
+        self._next_id = 1
+        self._by_id.clear()
 
         content = None
         last_err = None
@@ -37,7 +41,7 @@ class PlaylistManager:
             raise RuntimeError("Файл пуст")
 
         pending_info = None
-        attr_re = re.compile(r'([A-Za-z0-9_\-]+)="([^"]*)"')
+        attr_re = re.compile(r'([A-Za-z0-9_\-]+)=["\']([^"\']*)["\']')
 
         for line in lines:
             if line.startswith("#EXTINF:"):
@@ -57,12 +61,16 @@ class PlaylistManager:
                 if pending_info is None:
                     pending_info = {"name": f"Channel {len(self.channels) + 1}",
                                     "group": "", "tvg_id": ""}
-                self.channels.append(Channel(
-                    id=len(self.channels) + 1,
-                    name=pending_info["name"] or f"Channel {len(self.channels) + 1}",
+                channel_id = self._next_id
+                self._next_id += 1
+                channel = Channel(
+                    id=channel_id,
+                    name=pending_info["name"] or f"Channel {channel_id}",
                     url=line,
                     group=pending_info["group"],
-                ))
+                )
+                self.channels.append(channel)
+                self._by_id[channel_id] = channel
                 pending_info = None
 
         return len(self.channels)
@@ -74,18 +82,12 @@ class PlaylistManager:
         if 0 <= index < len(self.channels):
             removed = self.channels[index]
             self.broadcast_channel_ids.discard(removed.id)
+            self._by_id.pop(removed.id, None)
             del self.channels[index]
-        # Переназначаем id подряд
-        for new_id, ch in enumerate(self.channels, start=1):
-            ch.id = new_id
-        # После переназначения id старый broadcast-набор некорректен — сбрасываем
-        self.broadcast_channel_ids.clear()
+        # ID не переназначаем: на них ссылаются оверлеи и активные FFmpeg-процессы.
 
     def get_channel_by_id(self, channel_id: int) -> Optional[Channel]:
-        for ch in self.channels:
-            if ch.id == channel_id:
-                return ch
-        return None
+        return self._by_id.get(channel_id)
 
     # ------------------------------------------------------------------
     # Исходящий плейлист

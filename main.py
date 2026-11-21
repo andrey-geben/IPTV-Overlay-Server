@@ -73,7 +73,7 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("IPTV Overlay Server")
-    app.setApplicationVersion("1.1.0")
+    app.setApplicationVersion("1.1.1")
     app.setOrganizationName("andrey-geben")
 
     icon = ensure_icon()
