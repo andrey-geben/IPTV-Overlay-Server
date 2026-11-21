@@ -920,6 +920,25 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Внимание", "Введите текст")
             return
 
+        # Один канал — один активный FFmpeg. Не даём создать второй оверлей,
+        # который позже молча заменит первый.
+        conflicts = []
+        selected = set(channel_ids)
+        for existing in self.overlays:
+            common = selected & set(existing.channel_ids)
+            for cid in common:
+                channel = self.playlist_manager.get_channel_by_id(cid)
+                conflicts.append((channel.name if channel else str(cid), existing.id))
+        if conflicts:
+            details = "\n".join(f"• {name} — оверлей {oid}" for name, oid in conflicts)
+            QMessageBox.warning(
+                self, "Канал уже занят",
+                "На эти каналы уже назначен оверлей:\n\n"
+                f"{details}\n\n"
+                "Удалите старый оверлей или выберите другие каналы."
+            )
+            return
+
         overlay_id = f"ov_{uuid.uuid4().hex[:8]}"
         start_date = self.date_start.date().toString("yyyy-MM-dd")
         end_date = ""

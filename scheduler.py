@@ -47,6 +47,10 @@ class OverlayScheduler:
             if not self._should_run_today(overlay):
                 return
             for cid in overlay.channel_ids:
+                if any(other is not overlay and other.active and cid in other.channel_ids
+                       for other in self._overlays.values()):
+                    print(f"[Scheduler] Канал {cid} уже занят другим оверлеем — пропуск")
+                    continue
                 channel = self.playlist_manager.get_channel_by_id(cid)
                 if channel:
                     try:
